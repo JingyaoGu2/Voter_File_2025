@@ -827,3 +827,201 @@ which yields:
 s3://datahub-redshift-ohio/parquet/votehistory/state=AK/pull_date=2024-12-24/election=general/votehistory.parquet
 s3://datahub-redshift-ohio/parquet/votehistory/state=AK/pull_date=2024-10-02/election=primary/votehistory.parquet
 ```
+
+### Step 4: Do some testing to make sure the voter file and vote history tables contain the columns we want  
+
+Run this script, change path1, path2 to this year's table and previous year's, it will display all columns and diffs
+```
+# %% [markdown]
+# # Parquet Schema Comparison
+# Comparing schemas between two L2 voter file parquet files
+
+# %%
+import pyarrow.parquet as pq
+import s3fs
+import pandas as pd
+from IPython.display import display, HTML
+
+
+pd.set_option('display.max_columns', None)
+pd.set_option('display.max_rows', None)
+pd.set_option('display.width', None)
+pd.set_option('display.max_colwidth', None)
+
+
+# %%
+def get_schema_dict(parquet_path, s3_fs):
+    """Get schema as a dictionary of field_name: field_type"""
+    try:
+        with s3_fs.open(parquet_path, 'rb') as f:
+            parquet_file = pq.ParquetFile(f)
+            schema = parquet_file.schema_arrow
+        
+        # Convert to dictionary for easy comparison
+        schema_dict = {field.name: str(field.type) for field in schema}
+        return schema_dict, None
+    except Exception as e:
+        return None, str(e)
+
+# %%
+# CONFIG - File paths
+path1 = "s3://datahub-redshift-ohio/parquet/votehistory/state=AK/pull_date=2024-12-24/election=general/0000_part_00.parquet"
+path2 = "s3://datahub-redshift-ohio/l2_files/ky_la_ms_nj_va_vf_and_vh_20240823/vh_spectrum_parquet/ky/0000_part_00.parquet"
+
+print(" Parquet Schema Comparison")
+print("="*80)
+print(f"File 1 (2024): {path1}")
+print(f"File 2 (2022): {path2}")
+print("="*80)
+
+# %%
+# Read schemas
+s3 = s3fs.S3FileSystem()
+print("Reading schemas...")
+
+schema1, error1 = get_schema_dict(path1, s3)
+schema2, error2 = get_schema_dict(path2, s3)
+
+# Convert File 1 field names to lowercase for comparison
+if schema1:
+    schema1 = {field_name.lower(): field_type for field_name, field_type in schema1.items()}
+    print("✅ Converted File 1 field names to lowercase")
+
+if error1:
+    print(f"❌ Error reading File 1: {error1}")
+if error2:
+    print(f"❌ Error reading File 2: {error2}")
+
+if schema1 and schema2:
+    print(f"✅ File 1 has {len(schema1)} fields")
+    print(f"✅ File 2 has {len(schema2)} fields")
+
+# %%
+# Create side-by-side comparison of all fields
+def create_side_by_side_comparison(schema1, schema2, max_rows=None):
+    """Create a side-by-side DataFrame comparison of schemas"""
+    
+    # Convert to lists and pad to same length
+    fields1 = [(name, dtype) for name, dtype in schema1.items()]
+    fields2 = [(name, dtype) for name, dtype in schema2.items()]
+    
+    # Sort both for easier comparison
+    fields1.sort()
+    fields2.sort()
+    
+    max_len = max(len(fields1), len(fields2))
+    
+    # Pad shorter list with empty tuples
+    while len(fields1) < max_len:
+        fields1.append(("", ""))
+    while len(fields2) < max_len:
+        fields2.append(("", ""))
+    
+    # Limit rows if specified
+    if max_rows:
+        fields1 = fields1[:max_rows]
+        fields2 = fields2[:max_rows]
+        max_len = max_rows
+    
+    # Create DataFrame
+    comparison_df = pd.DataFrame({
+        'File 1 (2024) - Field Name': [f[0] for f in fields1],
+        'File 1 (2024) - Type': [f[1] for f in fields1],
+        'File 2 (2022) - Field Name': [f[0] for f in fields2],
+        'File 2 (2022) - Type': [f[1] for f in fields2],
+    })
+    
+    return comparison_df
+
+# Show first 50 fields side by side
+print(" Side-by-Side Field Comparison")
+comparison_df = create_side_by_side_comparison(schema1, schema2, max_rows=5000)
+display(comparison_df)
+
+# %%
+# Analysis of differences
+fields1 = set(schema1.keys())
+fields2 = set(schema2.keys())
+
+common_fields = fields1 & fields2
+only_in_1 = fields1 - fields2
+only_in_2 = fields2 - fields1
+
+print(" SCHEMA ANALYSIS")
+print("="*50)
+print(f"Total fields in File 1: {len(fields1)}")
+print(f"Total fields in File 2: {len(fields2)}")
+print(f"Common fields: {len(common_fields)}")
+print(f"Fields only in File 1: {len(only_in_1)}")
+print(f"Fields only in File 2: {len(only_in_2)}")
+
+# %%
+# Show field patterns analysis
+def analyze_field_patterns(schema_dict, file_name):
+    """Analyze common patterns in field names"""
+    fields = list(schema_dict.keys())
+    
+    print(f"\n Field Pattern Analysis for {file_name}")
+    print("-" * 40)
+    
+    # Look for common prefixes
+    prefixes = {}
+    for field in fields:
+        if '_' in field:
+            prefix = field.split('_')[0]
+            prefixes[prefix] = prefixes.get(prefix, 0) + 1
+    
+    print("Common prefixes (top 10):")
+    for prefix, count in sorted(prefixes.items(), key=lambda x: x[1], reverse=True)[:10]:
+        print(f"  {prefix}_*: {count} fields")
+    
+    # Show first 20 fields
+    print(f"\nFirst 20 fields:")
+    for i, field in enumerate(fields[:20], 1):
+        print(f"  {i:2d}. {field}")
+    
+    if len(fields) > 20:
+        print(f"  ... and {len(fields) - 20} more fields")
+
+analyze_field_patterns(schema1, "File 1 (2024)")
+analyze_field_patterns(schema2, "File 2 (2022)")
+
+# %%
+# Create searchable comparison table for all fields
+print(" Complete Field Comparison (All Fields)")
+full_comparison_df = create_side_by_side_comparison(schema1, schema2)
+
+# Style the DataFrame for better readability
+styled_df = full_comparison_df.style.set_properties(**{
+    'text-align': 'left',
+    'font-size': '12px',
+    'border': '1px solid black'
+}).set_table_styles([
+    {'selector': 'th', 'props': [('background-color', '#40466e'), ('color', 'white')]},
+    {'selector': 'tr:nth-of-type(odd)', 'props': [('background-color', '#f2f2f2')]},
+])
+
+display(styled_df)
+
+# %%
+# Summary statistics
+print("\n FINAL SUMMARY")
+print("="*50)
+
+if len(common_fields) == 0:
+    print("❌ NO COMMON FIELDS - These files have completely different schemas!")
+    print("   This suggests:")
+    print("   • Different L2 data products")
+    print("   • Different processing pipelines")
+    print("   • Major schema changes between versions")
+else:
+    print(f"✅ {len(common_fields)} fields in common")
+
+print(f"\ Schema Comparison:")
+print(f"   File 1 (2024): {len(schema1)} fields")
+print(f"   File 2 (2022): {len(schema2)} fields")
+print(f"   Overlap: {len(common_fields)} fields ({len(common_fields)/max(len(schema1), len(schema2))*100:.1f}%)")
+
+# %%
+```
+
