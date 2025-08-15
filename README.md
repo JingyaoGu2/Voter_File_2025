@@ -885,16 +885,16 @@ schema2, error2 = get_schema_dict(path2, s3)
 # Convert File 1 field names to lowercase for comparison
 if schema1:
     schema1 = {field_name.lower(): field_type for field_name, field_type in schema1.items()}
-    print("✅ Converted File 1 field names to lowercase")
+    print(" Converted File 1 field names to lowercase")
 
 if error1:
-    print(f"❌ Error reading File 1: {error1}")
+    print(f" Error reading File 1: {error1}")
 if error2:
-    print(f"❌ Error reading File 2: {error2}")
+    print(f" Error reading File 2: {error2}")
 
 if schema1 and schema2:
-    print(f"✅ File 1 has {len(schema1)} fields")
-    print(f"✅ File 2 has {len(schema2)} fields")
+    print(f" File 1 has {len(schema1)} fields")
+    print(f" File 2 has {len(schema2)} fields")
 
 # %%
 # Create side-by-side comparison of all fields
@@ -1009,13 +1009,13 @@ print("\n FINAL SUMMARY")
 print("="*50)
 
 if len(common_fields) == 0:
-    print("❌ NO COMMON FIELDS - These files have completely different schemas!")
+    print(" NO COMMON FIELDS - These files have completely different schemas!")
     print("   This suggests:")
     print("   • Different L2 data products")
     print("   • Different processing pipelines")
     print("   • Major schema changes between versions")
 else:
-    print(f"✅ {len(common_fields)} fields in common")
+    print(f" {len(common_fields)} fields in common")
 
 print(f"\ Schema Comparison:")
 print(f"   File 1 (2024): {len(schema1)} fields")
@@ -1024,4 +1024,529 @@ print(f"   Overlap: {len(common_fields)} fields ({len(common_fields)/max(len(sch
 
 # %%
 ```
+# Aug 15 Update:
+Process vote_history.py  
+This code significantly reduces workload by filtering only necessary columns
 
+```
+#!/usr/bin/env python3
+"""
+Convert L2 VOTEHISTORY inside an S3 ZIP to Parquet on S3.
+
+Usage (direct):
+  export AWS_PROFILE=jingyao
+  python process_votehistory_to_parquet.py \
+    --bucket datahub-redshift-ohio \
+    --key l2_updates/VM2--AK--2024-10-02.zip \
+    --election primary \
+    --flag Primary_2024_08_20 \
+    --out-prefix parquet/votehistory
+
+Usage (from finder JSONL; processes primary+general for chosen states):
+  python process_votehistory_to_parquet.py \
+    --bucket datahub-redshift-ohio \
+    --out-prefix parquet/votehistory \
+    --results vf_scan_2024.jsonl \
+    --states AK,AL \
+    --min-year 2024
+"""
+import os
+import io
+import re
+import json
+import csv
+import argparse
+import tempfile
+import zipfile
+from typing import Optional, Tuple, List
+
+import boto3
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+# --- patterns & helpers ---
+RE_VH = re.compile(r'(?i)(?:^|/)[^/]*vote[\s._-]*history[^/]*\.(csv|txt|tsv|tab|psv)$')
+RE_ANY_TEXT = re.compile(r'(?i)\.(csv|txt|tsv|tab|psv)$')
+ZIP_DATE = re.compile(r'--([A-Z]{2})--(\d{4}-\d{2}-\d{2})\.zip$')
+
+# columns that look like ..._YYYY_MM_DD at the end
+RE_DATE_SUFFIX = re.compile(r'_(\d{4})_\d{2}_\d{2}$')
+
+def s3c(profile: Optional[str] = None):
+    return (boto3.Session(profile_name=profile) if profile else boto3.Session()).client("s3")
+
+def parse_zip_key_state_date(key: str) -> Tuple[str, str]:
+    m = ZIP_DATE.search(key)
+    return (m.group(1) if m else "XX", m.group(2) if m else "unknown")
+
+def largest_votehistory_member(zf: zipfile.ZipFile) -> Optional[zipfile.ZipInfo]:
+    # Prefer files matching VOTEHISTORY pattern (ignore any *DataDictionary*)
+    cands = [inf for inf in zf.infolist()
+             if RE_VH.search(inf.filename)
+             and "dictionary" not in inf.filename.lower()]
+    if cands:
+        return max(cands, key=lambda x: x.file_size)
+    # Fallback: largest text-like file excluding dictionaries
+    txtish = [inf for inf in zf.infolist()
+              if RE_ANY_TEXT.search(inf.filename)
+              and "dictionary" not in inf.filename.lower()]
+    return max(txtish, key=lambda x: x.file_size) if txtish else None
+
+def sniff_sep(member_name: str, head_sample: str) -> str:
+    try:
+        dialect = csv.Sniffer().sniff(head_sample, delimiters=",\t|;")
+        return dialect.delimiter
+    except Exception:
+        low = member_name.lower()
+        if low.endswith((".tab", ".tsv")): return "\t"
+        if low.endswith(".psv"): return "|"
+        return ","
+
+# --- core streaming writer with schema freezing (all-string) ---
+def write_parquet_streaming(
+    zf: zipfile.ZipFile,
+    member: zipfile.ZipInfo,
+    local_out: str,
+    election_flag: Optional[str],
+    min_year: int = 2024,
+    chunksize: int = 400_000
+) -> Tuple[int, int]:
+    # sniff delimiter
+    with zf.open(member, "r") as fh_head:
+        sample = fh_head.read(65536).decode("utf-8", "replace")
+    sep = sniff_sep(member.filename, sample)
+
+    writer: Optional[pq.ParquetWriter] = None
+    total = 0
+    ones = 0
+    all_cols: Optional[List[str]] = None
+    schema: Optional[pa.Schema] = None
+
+    with zf.open(member, "r") as fh:
+        text = io.TextIOWrapper(fh, encoding="utf-8", errors="replace", newline="")
+        reader = pd.read_csv(text, dtype=str, chunksize=chunksize, low_memory=False, sep=sep)
+
+        for chunk in reader:
+            # --- Drop election/date columns older than min_year (keep flag even if older) ---
+            drop_cols = []
+            for c in chunk.columns:
+                m = RE_DATE_SUFFIX.search(c)
+                if m:
+                    try:
+                        yr = int(m.group(1))
+                    except Exception:
+                        continue
+                    if yr < min_year and (not election_flag or c != election_flag):
+                        drop_cols.append(c)
+            if drop_cols:
+                chunk = chunk.drop(columns=drop_cols)
+
+            if all_cols is None:
+                all_cols = list(chunk.columns)
+                schema = pa.schema([pa.field(c, pa.string()) for c in all_cols])
+
+            # align to first-chunk columns (add missing, drop extras), keep order
+            missing = [c for c in all_cols if c not in chunk.columns]
+            for c in missing:
+                chunk[c] = pd.NA
+            extras = [c for c in chunk.columns if c not in all_cols]
+            if extras:
+                chunk = chunk.drop(columns=extras)
+            chunk = chunk[all_cols]
+
+            # normalize a couple of common fields if present (optional)
+            for col in ("state", "STATE"):
+                if col in chunk.columns:
+                    chunk[col] = chunk[col].astype("string").str.upper().str.strip()
+            for col in ("county", "COUNTY"):
+                if col in chunk.columns:
+                    chunk[col] = chunk[col].astype("string").str.upper().str.strip()
+
+            # count election flag (treat '1' or 'Y' as voted)
+            if election_flag and election_flag in chunk.columns:
+                ones += chunk[election_flag].fillna("0").astype("string").str.upper().isin(["1", "Y"]).sum()
+
+            # cast everything to string so we never get null-vs-string schema flips
+            chunk = chunk.astype("string")
+
+            tbl = pa.Table.from_pandas(chunk, preserve_index=False, schema=schema, safe=False)
+            if writer is None:
+                writer = pq.ParquetWriter(local_out, schema, compression="zstd")
+            writer.write_table(tbl)
+            total += len(chunk)
+
+    if writer:
+        writer.close()
+    return int(total), int(ones)
+
+# --- one-zip processor ---
+def process_one_zip(
+    s3,
+    bucket: str,
+    key: str,
+    out_prefix: str,
+    election_type: str,
+    election_flag: Optional[str],
+    min_year: int,
+    overwrite: bool = True
+) -> Tuple[str, str]:
+    state, pull_date = parse_zip_key_state_date(key)
+    base = f"{out_prefix.rstrip('/')}/state={state}/pull_date={pull_date}/election={election_type}"
+    out_parquet = f"{base}/votehistory.parquet"
+    out_stats   = f"{base}/_stats.json"
+
+    if not overwrite:
+        try:
+            s3.head_object(Bucket=bucket, Key=out_parquet)
+            print(f"[SKIP] exists: s3://{bucket}/{out_parquet}")
+            return out_parquet, out_stats
+        except Exception:
+            pass
+
+    print(f"==> {state} {election_type} | {key} | pull_date={pull_date} | flag={election_flag or 'n/a'} | min_year={min_year}")
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    zf = zipfile.ZipFile(io.BytesIO(obj["Body"].read()))
+    member = largest_votehistory_member(zf)
+    if not member:
+        raise RuntimeError(f"No VOTEHISTORY file found in ZIP: s3://{bucket}/{key}")
+
+    with tempfile.TemporaryDirectory() as td:
+        local_out = os.path.join(td, f"{state}_{pull_date}_{election_type}.parquet")
+        rows, ones = write_parquet_streaming(
+            zf, member, local_out, election_flag=election_flag, min_year=min_year
+        )
+        print(f"[LOCAL] {rows:,} rows -> {local_out}")
+        s3.upload_file(local_out, bucket, out_parquet)
+        print(f"[S3] uploaded parquet -> s3://{bucket}/{out_parquet}")
+
+    stats = {
+        "state": state,
+        "pull_date": pull_date,
+        "election": election_type,
+        "flag_field": election_flag,
+        "rows": int(rows),
+        "flag_ones": int(ones),
+        "min_year": int(min_year),
+        "dropped_rule": "drop columns ending with _YYYY_MM_DD where YYYY < min_year (flag preserved)",
+    }
+    s3.put_object(Bucket=bucket, Key=out_stats, Body=json.dumps(stats).encode("utf-8"))
+    print(f"[S3] uploaded stats -> s3://{bucket}/{out_stats}")
+    return out_parquet, out_stats
+
+# --- runner modes ---
+def run_from_results(args):
+    s3 = s3c(args.profile)
+    wanted = set(s.strip().upper() for s in args.states.split(",")) if args.states else None
+    with open(args.results) as f:
+        for line in f:
+            rec = json.loads(line)
+            st = (rec.get("state") or "").upper()
+            if not st or (wanted and st not in wanted):
+                continue
+
+            # primary
+            p = rec.get("primary")
+            if p and p.get("zip"):
+                process_one_zip(
+                    s3, args.bucket, p["zip"], args.out_prefix,
+                    election_type="primary",
+                    election_flag=(p.get("columns") or [None])[0],
+                    min_year=args.min_year,
+                    overwrite=(not args.no_overwrite),
+                )
+
+            # general
+            g = rec.get("general")
+            if g and g.get("zip"):
+                process_one_zip(
+                    s3, args.bucket, g["zip"], args.out_prefix,
+                    election_type="general",
+                    election_flag=(g.get("columns") or [None])[0],
+                    min_year=args.min_year,
+                    overwrite=(not args.no_overwrite),
+                )
+    print("[DONE] from results")
+
+def run_direct(args):
+    s3 = s3c(args.profile)
+    assert args.key and args.election, "--key and --election are required in direct mode"
+    process_one_zip(
+        s3, args.bucket, args.key, args.out_prefix,
+        election_type=args.election,
+        election_flag=args.flag,
+        min_year=args.min_year,
+        overwrite=(not args.no_overwrite),
+    )
+
+# --- cli ---
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--bucket", required=True)
+    ap.add_argument("--out-prefix", default="parquet/votehistory")
+    ap.add_argument("--profile", default=os.environ.get("AWS_PROFILE"))
+
+    # Mode A: from results JSONL
+    ap.add_argument("--results", help="finder JSONL (e.g., vf_scan_2024.jsonl)")
+    ap.add_argument("--states", help="Comma-separated states to include (e.g., AK,AL)")
+
+    # Mode B: direct
+    ap.add_argument("--key", help="S3 key to a ZIP")
+    ap.add_argument("--election", help="e.g., general|primary")
+    ap.add_argument("--flag", help="Election flag column (e.g., General_2024_11_05)")
+
+    # Filter setting
+    ap.add_argument("--min-year", type=int, default=2024,
+                    help="Drop columns whose names end with _YYYY_MM_DD when YYYY < this year. Default: 2024")
+
+    ap.add_argument("--no-overwrite", action="store_true")
+    args = ap.parse_args()
+
+    if args.results:
+        run_from_results(args)
+    else:
+        run_direct(args)
+
+if __name__ == "__main__":
+    main()
+
+```
+
+## Current processing code demo:
+```
+(.venv) ubuntu@ip-10-11-65-4:~$ cat process_demo_to_parquet.py
+#!/usr/bin/env python3
+"""
+Extract DEMOGRAPHIC (voter master) from L2 ZIP(s) on S3 and write Parquet (ALL COLUMNS) to S3.
+
+Direct example:
+  export AWS_PROFILE=jingyao
+  python process_demo_to_parquet.py \
+    --bucket datahub-redshift-ohio \
+    --key l2_updates/VM2--AK--2024-12-24.zip \
+    --out-prefix parquet/demo
+
+Batch example (mirrors votehistory usage; processes both primary & general zips listed):
+  python process_demo_to_parquet.py \
+    --bucket datahub-redshift-ohio \
+    --out-prefix parquet/demo \
+    --results vf_scan_2024.jsonl \
+    --states AK,AL
+"""
+import os
+import io
+import re
+import sys
+import csv
+import json
+import argparse
+import tempfile
+import zipfile
+from typing import Optional, Tuple, List, Set
+
+import boto3
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+# --- patterns ---
+RE_ANY_TEXT = re.compile(r'(?i)\.(csv|txt|tsv|tab|psv)$')
+RE_DEMO_PRIORITIZED = re.compile(
+    r'(?i)(?:^|/)[^/]*?(?:DEMOGRAPHIC|DEMO|VOTER(?:FILE|_FILE|_MASTER)?)'
+    r'[^/]*\.(csv|txt|tsv|tab|psv)$'
+)
+ZIP_STATE_DATE = re.compile(r'--([A-Z]{2})--(\d{4}-\d{2}-\d{2})\.zip$')
+
+def s3c(profile: Optional[str] = None):
+    return (boto3.Session(profile_name=profile) if profile else boto3.Session()).client("s3")
+
+def parse_state_date_from_key(key: str) -> Tuple[str, str]:
+    m = ZIP_STATE_DATE.search(key)
+    return (m.group(1) if m else "XX", m.group(2) if m else "unknown")
+
+def sniff_sep(member_name: str, head_sample: str) -> str:
+    try:
+        dialect = csv.Sniffer().sniff(head_sample, delimiters=",\t|;")
+        return dialect.delimiter
+    except Exception:
+        low = member_name.lower()
+        if low.endswith((".tab", ".tsv")): return "\t"
+        if low.endswith(".psv"): return "|"
+        return ","
+
+def choose_demo_member(zf: zipfile.ZipFile) -> Optional[zipfile.ZipInfo]:
+    """Pick DEMOGRAPHIC-like text file, ignoring dictionaries; fallback by header containing lalvoterid."""
+    # Filter text-like & not a dictionary
+    candidates = [i for i in zf.infolist()
+                  if RE_ANY_TEXT.search(i.filename or "")
+                  and "dictionary" not in (i.filename or "").lower()]
+
+    # Prefer names that look like DEMOGRAPHIC/DEMO/VOTERFILE
+    pri = [i for i in candidates if RE_DEMO_PRIORITIZED.search(i.filename or "")]
+    if pri:
+        return max(pri, key=lambda x: x.file_size)
+
+    # Fallback: largest text file whose first line (header) contains lalvoterid
+    best = None
+    best_size = -1
+    for inf in candidates:
+        try:
+            with zf.open(inf, "r") as fh:
+                head = fh.read(128 * 1024).decode("utf-8", "replace")
+            first = (head.splitlines() or [""])[0]
+            header_fields = re.split(r"[,|\t;]", first)
+            if any(c.strip().lower() == "lalvoterid" for c in header_fields):
+                if inf.file_size > best_size:
+                    best, best_size = inf, inf.file_size
+        except Exception:
+            pass
+    return best
+
+def write_parquet_streaming_allcols(
+    zf: zipfile.ZipFile,
+    member: zipfile.ZipInfo,
+    local_out: str,
+    chunksize: int = 400_000
+) -> Tuple[int, int]:
+    """Read ALL columns, freeze first-chunk schema to all-string, stream to Parquet."""
+    # Sniff delimiter
+    with zf.open(member, "r") as fh_head:
+        sample = fh_head.read(65536).decode("utf-8", "replace")
+    sep = sniff_sep(member.filename, sample)
+
+    writer: Optional[pq.ParquetWriter] = None
+    total_rows = 0
+    ncols = 0
+    all_cols: Optional[List[str]] = None
+    schema: Optional[pa.Schema] = None
+
+    with zf.open(member, "r") as fh:
+        text = io.TextIOWrapper(fh, encoding="utf-8", errors="replace", newline="")
+        reader = pd.read_csv(text, dtype=str, chunksize=chunksize, low_memory=False, sep=sep)
+
+        for chunk in reader:
+            if all_cols is None:
+                all_cols = list(chunk.columns)
+                ncols = len(all_cols)
+                schema = pa.schema([pa.field(c, pa.string()) for c in all_cols])
+
+            # Align to first-chunk columns
+            missing = [c for c in all_cols if c not in chunk.columns]
+            for c in missing:
+                chunk[c] = pd.NA
+            extras = [c for c in chunk.columns if c not in all_cols]
+            if extras:
+                chunk = chunk.drop(columns=extras)
+            chunk = chunk[all_cols]
+
+            # Force all string to stabilize schema
+            chunk = chunk.astype("string")
+
+            tbl = pa.Table.from_pandas(chunk, preserve_index=False, schema=schema, safe=False)
+            if writer is None:
+                writer = pq.ParquetWriter(local_out, schema, compression="zstd")
+            writer.write_table(tbl)
+            total_rows += len(chunk)
+
+    if writer:
+        writer.close()
+    return int(total_rows), int(ncols)
+
+def process_one_zip(s3, bucket: str, key: str, out_prefix: str, overwrite: bool = True) -> Tuple[str, str]:
+    state, pull_date = parse_state_date_from_key(key)
+    dest_prefix = f"{out_prefix.rstrip('/')}/state={state}/pull_date={pull_date}"
+    out_parquet = f"{dest_prefix}/demo.parquet"
+    out_stats   = f"{dest_prefix}/_stats.json"
+
+    if not overwrite:
+        try:
+            s3.head_object(Bucket=bucket, Key=out_parquet)
+            print(f"[SKIP] exists: s3://{bucket}/{out_parquet}")
+            return out_parquet, out_stats
+        except Exception:
+            pass
+
+    print(f"==> DEMO {state} | {key} | pull_date={pull_date}")
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    zf = zipfile.ZipFile(io.BytesIO(obj["Body"].read()))
+
+    member = choose_demo_member(zf)
+    if not member:
+        raise RuntimeError(f"No DEMOGRAPHIC file found in ZIP: s3://{bucket}/{key}")
+
+    with tempfile.TemporaryDirectory() as td:
+        local_out = os.path.join(td, f"{state}_{pull_date}_demo.parquet")
+        rows, ncols = write_parquet_streaming_allcols(zf, member, local_out)
+        print(f"[LOCAL] {rows:,} rows, {ncols} columns -> {local_out}")
+        s3.upload_file(local_out, bucket, out_parquet)
+        print(f"[S3] uploaded -> s3://{bucket}/{out_parquet}")
+
+    # small stats doc
+    stats = {"state": state, "pull_date": pull_date, "rows": int(rows), "columns": int(ncols)}
+    s3.put_object(Bucket=bucket, Key=out_stats, Body=json.dumps(stats).encode("utf-8"))
+    print(f"[S3] uploaded stats -> s3://{bucket}/{out_stats}")
+
+    return out_parquet, out_stats
+
+# -------- runners --------
+def run_direct(args):
+    s3 = s3c(args.profile)
+    return process_one_zip(s3, args.bucket, args.key, args.out_prefix, overwrite=(not args.no_overwrite))
+
+def run_from_results(args):
+    s3 = s3c(args.profile)
+    wanted: Optional[Set[str]] = set(x.strip().upper() for x in args.states.split(",")) if args.states else None
+
+    # Build a set of ZIP keys to avoid duplicates when primary/general share the same ZIP
+    to_process: Set[str] = set()
+    with open(args.results) as f:
+        for line in f:
+            rec = json.loads(line)
+            st = (rec.get("state") or "").upper()
+            if not st or (wanted and st not in wanted):
+                continue
+            for k in ("primary", "general"):
+                node = rec.get(k) or {}
+                z = node.get("zip")
+                if z:
+                    to_process.add(z)
+
+    if not to_process:
+        print("[INFO] nothing to process from results (check --states and JSONL).")
+        return
+
+    for key in sorted(to_process):
+        process_one_zip(s3, args.bucket, key, args.out_prefix, overwrite=(not args.no_overwrite))
+
+    print("[DONE] demo from results")
+
+# -------- cli --------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--bucket", required=True)
+    ap.add_argument("--out-prefix", default="parquet/demo")
+    ap.add_argument("--profile", default=os.environ.get("AWS_PROFILE"))
+    ap.add_argument("--no-overwrite", action="store_true")
+
+    # Mode A: batch from finder JSONL
+    ap.add_argument("--results", help="finder JSONL (e.g., vf_scan_2024.jsonl)")
+    ap.add_argument("--states", help="Comma-separated states to include (e.g., AK,AL)")
+
+    # Mode B: direct single ZIP
+    ap.add_argument("--key", help="ZIP key like l2_updates/VM2--AK--YYYY-MM-DD.zip")
+
+    args = ap.parse_args()
+
+    if args.results:
+        run_from_results(args)
+    elif args.key:
+        run_direct(args)
+    else:
+        print("Provide either --results (batch) or --key (direct).", file=sys.stderr)
+        sys.exit(2)
+
+if __name__ == "__main__":
+    main()
+```
+
+### Step 5: Create external tables in redshift
